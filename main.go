@@ -1,14 +1,13 @@
 package main
 
 import (
+	"example.com/lambda/entities"
 	"fmt"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"log"
 	"os"
-	"time"
+	"sync"
 )
 
 func exitErrorf(msg string, args ...interface{}) {
@@ -16,17 +15,7 @@ func exitErrorf(msg string, args ...interface{}) {
 	os.Exit(1)
 }
 
-type S3Object struct {
-	Name         string    `json:"name"`
-	LastModified time.Time `json:"last_modified"`
-	Size         int64     `json:"size"`
-}
-
-type Response struct {
-	Items []S3Object `json:"items"`
-}
-
-func Handler() (Response, error) {
+func Handler() (entities.Response, error) {
 
 	sess, err := session.NewSession()
 
@@ -37,35 +26,62 @@ func Handler() (Response, error) {
 	svc := s3.New(sess)
 	bucket := os.Getenv("BUCKET_NAME")
 
-	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: &bucket})
+	resp, err := svc.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket: &bucket,
+	})
 
 	if err != nil {
 		exitErrorf("Unable to list items in bucket %q, %v", bucket, err)
 	}
 
-	contents := Response{}
+	contents := entities.CreateNewResponse()
 
-	// transform it into async
-	for _, item := range resp.Contents {
-		_, err := svc.PutObject(&s3.PutObjectInput{
-			Bucket:  &bucket,
-			Key:      item.Key,
-			Metadata: map[string]*string{"foo" : aws.String("ok")},
-		})
-
-		if err != nil {
-			log.Printf("Error while trying to update object %q, %v", *item.Key, err)
-			continue
-		}
-
-		contents.Items = append(contents.Items, S3Object{
-			Name:         *item.Key,
-			LastModified: *item.LastModified,
-			Size:         *item.Size,
-		})
-	}
+	contents = updateBucketItems(resp, svc, bucket, contents)
 
 	return contents, nil
+}
+
+func getString(item string) *string {
+	return &item
+}
+
+func updateBucketItems(
+	resp *s3.ListObjectsV2Output,
+	svc *s3.S3,
+	bucket string,
+	contents entities.Response,
+) entities.Response {
+	var wg sync.WaitGroup
+	wg.Add(len(resp.Contents))
+	for i, item := range resp.Contents {
+		item := item
+		go func(i int) {
+			defer wg.Done()
+
+			_, err := svc.PutObject(&s3.PutObjectInput{
+				Bucket:   &bucket,
+				Key:      item.Key,
+				Metadata: map[string]*string{"content": getString("ok")},
+			})
+
+			if err != nil {
+				fmt.Printf("Error while trying to update object %q, %v", *item.Key, err)
+				return
+			}
+
+			contents.AddItem(entities.S3Object{
+				Name:         *item.Key,
+				LastModified: *item.LastModified,
+				Size:         *item.Size,
+			})
+
+			fmt.Printf("Finished processing %q. Going to another item on the list.", *item.Key)
+		}(i)
+	}
+
+	wg.Wait()
+
+	return contents
 }
 
 func main() {
